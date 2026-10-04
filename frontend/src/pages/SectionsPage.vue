@@ -3,16 +3,11 @@ import { computed, ref, watch } from 'vue'
 import type { Artifact, Stratum } from '@/types'
 import { stratumThickness } from '@/types'
 import StratumDepthBar from '@/components/common/StratumDepthBar.vue'
-import { useStore } from '@/hooks/usePersistentStore'
-import { stratumStore } from '@/stores/stratumStore'
-import { trenchStore } from '@/stores/trenchStore'
-import { artifactStore } from '@/stores/artifactStore'
+import { useCatalog } from '@/hooks/useCatalog'
 
 const WALLS = ['北壁', '东壁', '南壁', '西壁'] as const
 
-const stratumState = useStore(stratumStore)
-const trenchState = useStore(trenchStore)
-const artifactState = useStore(artifactStore)
+const catalog = useCatalog()
 
 const selectedTrenchId = ref('')
 const wall = ref<(typeof WALLS)[number]>('北壁')
@@ -23,19 +18,19 @@ const CANVAS_H = 460
 const SCALE_H = CANVAS_H - 70
 
 watch(
-  () => [trenchState.trenches.length, selectedTrenchId.value] as const,
+  () => [catalog.trenches.value.length, selectedTrenchId.value] as const,
   () => {
-    if (!selectedTrenchId.value && trenchState.trenches.length > 0) {
-      selectedTrenchId.value = trenchState.trenches[0].id
+    if (!selectedTrenchId.value && catalog.trenches.value.length > 0) {
+      selectedTrenchId.value = catalog.trenches.value[0].id
     }
   },
   { immediate: true }
 )
 
-const trench = computed(() => trenchState.trenches.find((item) => item.id === selectedTrenchId.value) ?? null)
+const trench = computed(() => catalog.trenches.value.find((item) => item.id === selectedTrenchId.value) ?? null)
 
 const strata = computed(() =>
-  stratumState.strata
+  catalog.strata.value
     .filter((item) => item.trenchId === selectedTrenchId.value)
     .sort((a, b) => a.topDepth - b.topDepth)
 )
@@ -58,7 +53,7 @@ const ticks = computed(() => {
 
 const artifactsOfTrench = computed<Artifact[]>(() => {
   const unitIds = strata.value.map((item) => item.id)
-  return artifactState.artifacts.filter((item) => unitIds.includes(item.stratumId))
+  return catalog.artifacts.value.filter((item) => unitIds.includes(item.stratumId))
 })
 
 /** 出土物在剖面上的投影位置：X 轴按探方内 X 坐标，Y 轴按出土深度 */
@@ -78,6 +73,16 @@ const unitColors: Record<string, string> = {
   沟: '#8fbfae',
   墓葬: '#d99b90'
 }
+
+const selectedState = computed(() =>
+  !selectedTrenchId.value
+    ? null
+    : catalog.isReadonly(selectedTrenchId.value)
+      ? '封存只读（展示最新封存版数据）'
+      : catalog.draftOf(selectedTrenchId.value)
+        ? '复勘草稿工作区（未提交）'
+        : '现行数据'
+)
 </script>
 
 <template>
@@ -91,7 +96,12 @@ const unitColors: Record<string, string> = {
       </div>
       <div class="head-actions">
         <el-select v-model="selectedTrenchId" placeholder="选择探方" style="width: 200px">
-          <el-option v-for="item in trenchState.trenches" :key="item.id" :label="`${item.area} · ${item.code}`" :value="item.id" />
+          <el-option
+            v-for="item in catalog.trenches.value"
+            :key="item.id"
+            :label="`${item.area} · ${item.code}${catalog.isReadonly(item.id) ? '（封存）' : catalog.draftOf(item.id) ? '（复勘中）' : ''}`"
+            :value="item.id"
+          />
         </el-select>
         <el-select v-model="wall" style="width: 120px">
           <el-option v-for="item in WALLS" :key="item" :label="item" :value="item" />
@@ -100,6 +110,14 @@ const unitColors: Record<string, string> = {
       </div>
     </div>
 
+    <el-alert
+      v-if="selectedState"
+      class="alert"
+      :type="catalog.isReadonly(selectedTrenchId) ? 'info' : 'warning'"
+      :closable="false"
+      show-icon
+      :title="`当前剖面数据来源：${selectedState}`"
+    />
     <el-alert
       v-if="strata.length === 0"
       class="alert"

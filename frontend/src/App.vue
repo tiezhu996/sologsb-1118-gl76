@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useStore } from '@/hooks/usePersistentStore'
 import { trenchStore } from '@/stores/trenchStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
+import { archiveStore } from '@/stores/archiveStore'
+import { onArchiveEvent } from '@/hooks/useArchiveEvents'
 
 const route = useRoute()
 const trenchState = useStore(trenchStore)
@@ -30,12 +32,25 @@ const stats = computed(() => [
   { label: '层位关系', value: relationState.relations.length }
 ])
 
+async function refreshAll(): Promise<void> {
+  await Promise.all([
+    trenchStore.getState().hydrate(),
+    stratumStore.getState().hydrate(),
+    artifactStore.getState().hydrate(),
+    relationStore.getState().hydrate(),
+    archiveStore.getState().hydrate()
+  ])
+}
+
 onMounted(async () => {
-  await trenchStore.getState().hydrate()
-  await stratumStore.getState().hydrate()
-  await artifactStore.getState().hydrate()
-  await relationStore.getState().hydrate()
+  await refreshAll()
 })
+
+// 另一标签页封存/提交/开草稿后，本标签页自动重取，保证乐观锁判断基于最新数据
+const unsubscribeEvents = onArchiveEvent(() => {
+  void refreshAll()
+})
+onUnmounted(() => unsubscribeEvents())
 </script>
 
 <template>

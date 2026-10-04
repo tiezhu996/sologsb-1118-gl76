@@ -6,3 +6,11 @@ export { ARTIFACT_CATEGORIES, COMPLETENESS } from './artifact'
 export type { Artifact, ArtifactCategory, Completeness } from './artifact'
 export { RELATION_TYPES, RELATION_BASES } from './relation'
 export type { Relation, RelationType, RelationBasis } from './relation'
+export type {
+  ArchiveVersion,
+  ArchiveStratum,
+  ArchiveArtifact,
+  ArchiveRelation,
+  SurveyDraft,
+  DraftStatus
+} from './archive'

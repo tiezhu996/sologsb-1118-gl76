@@ -1,27 +1,20 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Inclusion, Stratum, UnitType } from '@/types'
+import type { Inclusion, Stratum, SurveyDraft, UnitType } from '@/types'
 import { INCLUSIONS, UNIT_TYPES, isCodeDuplicated, isDepthInverted, stratumThickness } from '@/types'
 import StratumDepthBar from '@/components/common/StratumDepthBar.vue'
 import TrenchTag from '@/components/common/TrenchTag.vue'
-import { useStore } from '@/hooks/usePersistentStore'
+import DraftBanner from '@/components/archive/DraftBanner.vue'
+import CommitDraftDialog from '@/components/archive/CommitDraftDialog.vue'
+import { useCatalog, ReadonlyArchiveError } from '@/hooks/useCatalog'
 import { useStratumOrder } from '@/hooks/useStratumOrder'
-import { stratumStore } from '@/stores/stratumStore'
-import { trenchStore } from '@/stores/trenchStore'
-import { artifactStore } from '@/stores/artifactStore'
-import { relationStore } from '@/stores/relationStore'
+import { discardDraft } from '@/services/archiveService'
 import { uid } from '@/utils/id'
 
-const trenchState = useStore(trenchStore)
-const stratumState = useStore(stratumStore)
-const artifactState = useStore(artifactStore)
-const relationState = useStore(relationStore)
+const catalog = useCatalog()
 
-const { result: order } = useStratumOrder(
-  computed(() => stratumState.strata),
-  computed(() => relationState.relations)
-)
+const { result: order } = useStratumOrder(catalog.strata, catalog.relations)
 
 const filterTrenchId = ref('')
 const filterType = ref<UnitType | ''>('')
@@ -32,6 +25,8 @@ const batchType = ref<UnitType>('地层')
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+const commitVisible = ref(false)
+const commitDraftRow = ref<SurveyDraft | null>(null)
 
 const form = reactive({
   trenchId: '',
@@ -48,7 +43,7 @@ const form = reactive({
 })
 
 const visible = computed(() =>
-  stratumState.strata.filter((item) => {
+  catalog.strata.value.filter((item) => {
     if (filterTrenchId.value && item.trenchId !== filterTrenchId.value) return false
     if (filterType.value && item.type !== filterType.value) return false
     if (depthFrom.value !== undefined && item.bottomDepth < depthFrom.value) return false
@@ -57,13 +52,16 @@ const visible = computed(() =>
   })
 )
 
+/** 当前编辑表单所属探方是否只读 */
+const formReadonly = computed(() => (form.trenchId ? catalog.isReadonly(form.trenchId) : false))
+
 function trenchLabel(trenchId: string): string {
-  const trench = trenchState.trenches.find((item) => item.id === trenchId)
+  const trench = catalog.trenches.value.find((item) => item.id === trenchId)
   return trench ? `${trench.area} · ${trench.code}` : '未知探方'
 }
 
 function artifactsOf(stratumId: string): number {
-  return artifactState.artifacts.filter((item) => item.stratumId === stratumId).reduce((sum, item) => sum + item.count, 0)
+  return catalog.artifacts.value.filter((item) => item.stratumId === stratumId).reduce((sum, item) => sum + item.count, 0)
 }
 
 function invertedOf(stratum: Stratum): boolean {
@@ -71,7 +69,7 @@ function invertedOf(stratum: Stratum): boolean {
 }
 
 function duplicatedOf(stratum: Stratum): boolean {
-  return isCodeDuplicated(stratumState.strata, stratum)
+  return isCodeDuplicated(catalog.strata.value, stratum)
 }
 
 function rowClass(param: { row: Stratum }): string {
@@ -85,16 +83,16 @@ const conflictOf = (code: string): string | null =>
   order.value.conflicts.find((item) => item.startsWith(code)) ?? null
 
 watch(
-  () => [trenchState.trenches.length, form.trenchId] as const,
+  () => [catalog.trenches.value.length, form.trenchId] as const,
   () => {
-    if (!form.trenchId && trenchState.trenches.length > 0) form.trenchId = trenchState.trenches[0].id
+    if (!form.trenchId && catalog.trenches.value.length > 0) form.trenchId = catalog.trenches.value[0].id
   },
   { immediate: true }
 )
 
 function resetForm(): void {
   editingId.value = null
-  form.trenchId = trenchState.trenches[0]?.id ?? ''
+  form.trenchId = catalog.trenches.value[0]?.id ?? ''
   form.code = ''
   form.type = '地层'
   form.openLayer = '第①层'
@@ -108,11 +106,23 @@ function resetForm(): void {
 }
 
 function openCreate(): void {
+  if (catalog.trenches.value.length === 0) {
+    ElMessage.warning('请先新建探方')
+    return
+  }
+  // 默认选中第一个非只读探方；都封存了则提示
+  const writable = catalog.trenches.value.find((item) => !catalog.isReadonly(item.id))
   resetForm()
+  if (writable) form.trenchId = writable.id
   dialogVisible.value = true
+  if (!writable) ElMessage.info('全部探方均已封存只读，请先在探方清单对某封存版开启复勘草稿')
 }
 
 function openEdit(stratum: Stratum): void {
+  if (catalog.isReadonly(stratum.trenchId)) {
+    ElMessage.info('该探方已回填封存，只读；如需修改请从封存版开启复勘草稿')
+    return
+  }
   editingId.value = stratum.id
   Object.assign(form, {
     trenchId: stratum.trenchId,
@@ -144,7 +154,7 @@ async function submit(): Promise<void> {
     return
   }
   const candidate = { id: editingId.value ?? uid('st'), trenchId: form.trenchId, code: form.code.trim().toUpperCase() }
-  if (isCodeDuplicated(stratumState.strata, candidate)) {
+  if (isCodeDuplicated(catalog.strata.value, candidate)) {
     ElMessage.error(`同一探方内单位号「${candidate.code}」已存在，请更换`)
     return
   }
@@ -162,18 +172,27 @@ async function submit(): Promise<void> {
     date: form.date,
     drawingNo: form.drawingNo.trim()
   }
-  await stratumStore.getState().save(row)
-  if (isDepthInverted(row)) {
-    ElMessage.warning(`已保存，但「${row.code}」上界深度大于下界，层序倒置需复核`)
-  } else {
-    ElMessage.success(`地层单位 ${row.code} 已保存（厚 ${stratumThickness(row)} m）`)
+  try {
+    await catalog.saveStratum(row)
+    if (isDepthInverted(row)) {
+      ElMessage.warning(`已保存到草稿/现行库，但「${row.code}」上界深度大于下界，层序倒置需复核`)
+    } else {
+      ElMessage.success(`地层单位 ${row.code} 已保存（厚 ${stratumThickness(row)} m）`)
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    if (error instanceof ReadonlyArchiveError) ElMessage.error(error.message)
+    else throw error
   }
-  dialogVisible.value = false
 }
 
 async function remove(stratum: Stratum): Promise<void> {
-  const count = artifactState.artifacts.filter((item) => item.stratumId === stratum.id).length
-  const relations = relationState.relations.filter(
+  if (catalog.isReadonly(stratum.trenchId)) {
+    ElMessage.error('封存探方只读，不能删除地层单位；请先开启复勘草稿')
+    return
+  }
+  const count = catalog.artifacts.value.filter((item) => item.stratumId === stratum.id).length
+  const relations = catalog.relations.value.filter(
     (item) => item.unitAId === stratum.id || item.unitBId === stratum.id
   ).length
   if (count > 0 || relations > 0) {
@@ -181,7 +200,7 @@ async function remove(stratum: Stratum): Promise<void> {
     return
   }
   await ElMessageBox.confirm(`确认删除地层单位「${stratum.code}」？`, '删除确认', { type: 'warning' })
-  await stratumStore.getState().remove(stratum.id)
+  await catalog.removeStratum(stratum.id)
   ElMessage.success('地层单位已删除')
 }
 
@@ -190,8 +209,27 @@ async function applyBatchType(): Promise<void> {
     ElMessage.warning('请先勾选要调整的单位')
     return
   }
-  await stratumStore.getState().bulkSetType(selectedIds.value, batchType.value)
-  ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
+  try {
+    await catalog.bulkSetStratumType(selectedIds.value, batchType.value)
+    ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
+  } catch (error) {
+    if (error instanceof ReadonlyArchiveError) ElMessage.error(error.message)
+    else throw error
+  }
+}
+
+function openCommit(draft: SurveyDraft): void {
+  commitDraftRow.value = draft
+  commitVisible.value = true
+}
+
+async function abandonDraft(draft: SurveyDraft): Promise<void> {
+  await ElMessageBox.confirm('放弃该复勘草稿？草稿中的修改不会进入任何封存版本。', '放弃草稿', {
+    type: 'warning',
+    confirmButtonText: '放弃草稿'
+  })
+  await discardDraft(draft.id)
+  ElMessage.success('草稿已放弃')
 }
 </script>
 
@@ -201,13 +239,15 @@ async function applyBatchType(): Promise<void> {
       <div>
         <h2 class="page-title">地层单位编目表</h2>
         <p class="page-sub">
-          按类型与深度区间筛选；层序倒置（上界大于下界）与同一探方内单位号重复即时高亮提示，深度刻度条展示厚度。
+          已回填封存的探方默认只读；复勘草稿中的单位以工作区数据展示，提交后才生成新封存版本。
         </p>
       </div>
       <el-button type="primary" @click="openCreate">
         <el-icon><Plus /></el-icon>新建地层单位
       </el-button>
     </div>
+
+    <DraftBanner @submit="openCommit" @discard="abandonDraft" />
 
     <el-alert
       v-if="order.inverted.length > 0 || order.duplicateCodes.length > 0"
@@ -227,18 +267,16 @@ async function applyBatchType(): Promise<void> {
         </p>
       </template>
     </el-alert>
-    <el-alert
-      v-else
-      class="alert"
-      type="success"
-      :closable="false"
-      show-icon
-      title="层序与单位号校验通过"
-    />
+    <el-alert v-else class="alert" type="success" :closable="false" show-icon title="层序与单位号校验通过" />
 
     <div class="toolbar">
       <el-select v-model="filterTrenchId" placeholder="全部探方" clearable style="width: 190px">
-        <el-option v-for="trench in trenchState.trenches" :key="trench.id" :label="`${trench.area} · ${trench.code}`" :value="trench.id" />
+        <el-option
+          v-for="trench in catalog.trenches.value"
+          :key="trench.id"
+          :label="`${trench.area} · ${trench.code}${catalog.isReadonly(trench.id) ? '（封存只读）' : catalog.draftOf(trench.id) ? '（复勘中）' : ''}`"
+          :value="trench.id"
+        />
       </el-select>
       <el-select v-model="filterType" placeholder="全部类型" clearable style="width: 130px">
         <el-option v-for="type in UNIT_TYPES" :key="type" :label="type" :value="type" />
@@ -253,7 +291,7 @@ async function applyBatchType(): Promise<void> {
         <el-option v-for="type in UNIT_TYPES" :key="type" :label="type" :value="type" />
       </el-select>
       <el-button type="primary" plain @click="applyBatchType">批量调整类型</el-button>
-      <el-tag type="info" effect="plain">命中 {{ visible.length }} / {{ stratumState.strata.length }} 个单位</el-tag>
+      <el-tag type="info" effect="plain">命中 {{ visible.length }} / {{ catalog.strata.value.length }} 个单位</el-tag>
     </div>
 
     <el-table
@@ -268,9 +306,11 @@ async function applyBatchType(): Promise<void> {
       <el-table-column label="序号" width="70">
         <template #default="{ row }: { row: Stratum }">{{ order.indexOf.get(row.id) ?? '—' }}</template>
       </el-table-column>
-      <el-table-column label="探方" width="150">
+      <el-table-column label="探方" width="170">
         <template #default="{ row }: { row: Stratum }">
           <span class="mono">{{ trenchLabel(row.trenchId) }}</span>
+          <el-tag v-if="catalog.isReadonly(row.trenchId)" size="small" type="info" effect="plain" class="mini">封存</el-tag>
+          <el-tag v-else-if="catalog.draftOf(row.trenchId)" size="small" type="warning" effect="plain" class="mini">复勘</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="单位号" width="110">
@@ -309,51 +349,73 @@ async function applyBatchType(): Promise<void> {
       </el-table-column>
       <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }: { row: Stratum }">
-          <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+          <el-button link type="primary" size="small" @click="openEdit(row)">
+            {{ catalog.isReadonly(row.trenchId) ? '查看' : '编辑' }}
+          </el-button>
+          <el-button
+            v-if="!catalog.isReadonly(row.trenchId)"
+            link
+            type="danger"
+            size="small"
+            @click="remove(row)"
+          >
+            删除
+          </el-button>
         </template>
       </el-table-column>
     </el-table>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑地层单位' : '新建地层单位'" width="680px">
+      <el-alert
+        v-if="formReadonly"
+        type="info"
+        :closable="false"
+        title="该探方已封存只读，表单内容不可修改"
+        style="margin-bottom: 10px"
+      />
       <el-form label-width="110px">
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="所属探方" required>
-              <el-select v-model="form.trenchId" style="width: 100%">
-                <el-option v-for="trench in trenchState.trenches" :key="trench.id" :label="`${trench.area} · ${trench.code}`" :value="trench.id" />
+              <el-select v-model="form.trenchId" :disabled="Boolean(editingId) || formReadonly" style="width: 100%">
+                <el-option
+                  v-for="trench in catalog.trenches.value"
+                  :key="trench.id"
+                  :label="`${trench.area} · ${trench.code}${catalog.isReadonly(trench.id) ? '（封存只读）' : catalog.draftOf(trench.id) ? '（复勘中）' : ''}`"
+                  :value="trench.id"
+                />
               </el-select>
             </el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item label="单位号" required>
-              <el-input v-model="form.code" placeholder="如 H12、L03" />
+              <el-input v-model="form.code" placeholder="如 H12、L03" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
         </el-row>
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="单位类型">
-              <el-select v-model="form.type" style="width: 100%">
+              <el-select v-model="form.type" style="width: 100%" :disabled="formReadonly">
                 <el-option v-for="type in UNIT_TYPES" :key="type" :label="type" :value="type" />
               </el-select>
             </el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item label="开口层位">
-              <el-input v-model="form.openLayer" placeholder="如 第②层下" />
+              <el-input v-model="form.openLayer" placeholder="如 第②层下" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
         </el-row>
         <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="上界深度(m)">
-              <el-input-number v-model="form.topDepth" :min="0" :step="0.05" :precision="2" :controls="false" style="width: 100%" />
+              <el-input-number v-model="form.topDepth" :min="0" :step="0.05" :precision="2" :controls="false" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="下界深度(m)">
-              <el-input-number v-model="form.bottomDepth" :min="0" :step="0.05" :precision="2" :controls="false" style="width: 100%" />
+              <el-input-number v-model="form.bottomDepth" :min="0" :step="0.05" :precision="2" :controls="false" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
@@ -363,35 +425,37 @@ async function applyBatchType(): Promise<void> {
           </el-col>
         </el-row>
         <el-form-item label="土质土色">
-          <el-input v-model="form.soil" placeholder="如 灰褐色砂质黏土，疏松" />
+          <el-input v-model="form.soil" placeholder="如 灰褐色砂质黏土，疏松" :disabled="formReadonly" />
         </el-form-item>
         <el-form-item label="包含物">
-          <el-checkbox-group v-model="form.inclusions">
+          <el-checkbox-group v-model="form.inclusions" :disabled="formReadonly">
             <el-checkbox v-for="item in INCLUSIONS" :key="item" :value="item">{{ item }}</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
         <el-form-item label="堆积成因">
-          <el-input v-model="form.formation" placeholder="如 生活垃圾坑" />
+          <el-input v-model="form.formation" placeholder="如 生活垃圾坑" :disabled="formReadonly" />
         </el-form-item>
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="发掘日期">
-              <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+              <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item label="绘图/拍照号">
-              <el-input v-model="form.drawingNo" placeholder="如 T0501-北壁-02" />
+              <el-input v-model="form.drawingNo" placeholder="如 T0501-北壁-02" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
         </el-row>
         <p v-if="form.topDepth > form.bottomDepth" class="warn">上界深度大于下界深度，保存后将标记为「层序倒置」</p>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submit">保存</el-button>
+        <el-button @click="dialogVisible = false">{{ formReadonly ? '关闭' : '取消' }}</el-button>
+        <el-button v-if="!formReadonly" type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <CommitDraftDialog v-model="commitVisible" :draft="commitDraftRow" @draft-rebased="() => (commitDraftRow = null)" />
   </div>
 </template>
 

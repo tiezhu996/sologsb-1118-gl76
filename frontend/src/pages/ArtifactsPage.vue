@@ -1,26 +1,27 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Artifact, ArtifactCategory, Completeness } from '@/types'
+import type { Artifact, ArtifactCategory, Completeness, SurveyDraft } from '@/types'
 import { ARTIFACT_CATEGORIES, COMPLETENESS } from '@/types'
 import StratumDepthBar from '@/components/common/StratumDepthBar.vue'
 import UnitPicker from '@/components/common/UnitPicker.vue'
-import { useStore } from '@/hooks/usePersistentStore'
-import { artifactStore } from '@/stores/artifactStore'
-import { stratumStore } from '@/stores/stratumStore'
-import { trenchStore } from '@/stores/trenchStore'
+import DraftBanner from '@/components/archive/DraftBanner.vue'
+import CommitDraftDialog from '@/components/archive/CommitDraftDialog.vue'
+import { useCatalog, ReadonlyArchiveError } from '@/hooks/useCatalog'
+import { discardDraft } from '@/services/archiveService'
 import { downloadCsv } from '@/utils/export'
 import { uid } from '@/utils/id'
 
-const artifactState = useStore(artifactStore)
-const stratumState = useStore(stratumStore)
-const trenchState = useStore(trenchStore)
+const catalog = useCatalog()
 
 const pickTrenchId = ref('')
 const pickStratumId = ref('')
 const filterCategory = ref<ArtifactCategory | ''>('')
 const filterTrenchId = ref('')
 const editingId = ref<string | null>(null)
+
+const commitVisible = ref(false)
+const commitDraftRow = ref<SurveyDraft | null>(null)
 
 const form = reactive({
   code: '',
@@ -35,14 +36,15 @@ const form = reactive({
   tempLocation: ''
 })
 
-const lockedStratum = computed(() => stratumState.strata.find((item) => item.id === pickStratumId.value) ?? null)
+const lockedStratum = computed(() => catalog.strata.value.find((item) => item.id === pickStratumId.value) ?? null)
+const formReadonly = computed(() => (lockedStratum.value ? catalog.isReadonly(lockedStratum.value.trenchId) : false))
 
 watch(
-  () => [trenchState.trenches.length, pickTrenchId.value] as const,
+  () => [catalog.trenches.value.length, pickTrenchId.value] as const,
   () => {
-    if (!pickTrenchId.value && trenchState.trenches.length > 0) {
-      pickTrenchId.value = trenchState.trenches[0].id
-      const first = stratumState.strata.find((item) => item.trenchId === pickTrenchId.value)
+    if (!pickTrenchId.value && catalog.trenches.value.length > 0) {
+      pickTrenchId.value = catalog.trenches.value[0].id
+      const first = catalog.strata.value.find((item) => item.trenchId === pickTrenchId.value)
       if (first) pickStratumId.value = first.id
     }
   },
@@ -50,13 +52,13 @@ watch(
 )
 
 watch(
-  () => [stratumState.strata.length, pickTrenchId.value] as const,
+  () => [catalog.strata.value.length, pickTrenchId.value] as const,
   () => {
-    const list = stratumState.strata.filter((item) => !pickTrenchId.value || item.trenchId === pickTrenchId.value)
+    const list = catalog.strata.value.filter((item) => !pickTrenchId.value || item.trenchId === pickTrenchId.value)
     if (!list.some((item) => item.id === pickStratumId.value)) {
       pickStratumId.value = list[0]?.id ?? ''
     }
-    if (lockedStratum.value && !editingId.value) {
+    if (lockedStratum.value && !editingId.value && !formReadonly.value) {
       form.z = Math.round(((lockedStratum.value.topDepth + lockedStratum.value.bottomDepth) / 2) * 100) / 100
     }
   },
@@ -64,21 +66,26 @@ watch(
 )
 
 function stratumOf(stratumId: string): string {
-  return stratumState.strata.find((item) => item.id === stratumId)?.code ?? '未知单位'
+  return catalog.strata.value.find((item) => item.id === stratumId)?.code ?? '未知单位'
 }
 
 function trenchOf(stratumId: string): string {
-  const stratum = stratumState.strata.find((item) => item.id === stratumId)
+  const stratum = catalog.strata.value.find((item) => item.id === stratumId)
   if (!stratum) return '未知探方'
-  const trench = trenchState.trenches.find((item) => item.id === stratum.trenchId)
+  const trench = catalog.trenches.value.find((item) => item.id === stratum.trenchId)
   return trench ? `${trench.area} · ${trench.code}` : '未知探方'
 }
 
+function isRowReadonly(artifact: Artifact): boolean {
+  const stratum = catalog.strata.value.find((item) => item.id === artifact.stratumId)
+  return stratum ? catalog.isReadonly(stratum.trenchId) : false
+}
+
 const visible = computed(() =>
-  artifactState.artifacts.filter((item) => {
+  catalog.artifacts.value.filter((item) => {
     if (filterCategory.value && item.category !== filterCategory.value) return false
     if (filterTrenchId.value) {
-      const stratum = stratumState.strata.find((row) => row.id === item.stratumId)
+      const stratum = catalog.strata.value.find((row) => row.id === item.stratumId)
       if (!stratum || stratum.trenchId !== filterTrenchId.value) return false
     }
     return true
@@ -104,8 +111,12 @@ function resetForm(): void {
 }
 
 function openEdit(artifact: Artifact): void {
+  const stratum = catalog.strata.value.find((item) => item.id === artifact.stratumId)
+  if (stratum && catalog.isReadonly(stratum.trenchId)) {
+    ElMessage.info('该出土物所属探方已封存只读；如需修改请开启复勘草稿')
+    return
+  }
   editingId.value = artifact.id
-  const stratum = stratumState.strata.find((item) => item.id === artifact.stratumId)
   if (stratum) {
     pickTrenchId.value = stratum.trenchId
     pickStratumId.value = stratum.id
@@ -133,7 +144,7 @@ async function submit(): Promise<void> {
     ElMessage.warning('请填写器物编号')
     return
   }
-  const duplicated = artifactState.artifacts.some(
+  const duplicated = catalog.artifacts.value.some(
     (item) => item.id !== editingId.value && item.code.trim().toUpperCase() === form.code.trim().toUpperCase()
   )
   if (duplicated) {
@@ -160,14 +171,24 @@ async function submit(): Promise<void> {
     collector: form.collector.trim(),
     tempLocation: form.tempLocation.trim()
   }
-  await artifactStore.getState().save(row)
-  ElMessage.success(`出土物 ${row.code} 已登记到 ${lockedStratum.value.code}`)
-  resetForm()
+  try {
+    await catalog.saveArtifact(row)
+    ElMessage.success(`出土物 ${row.code} 已登记到 ${lockedStratum.value.code}`)
+    resetForm()
+  } catch (error) {
+    if (error instanceof ReadonlyArchiveError) ElMessage.error(error.message)
+    else throw error
+  }
 }
 
 async function remove(artifact: Artifact): Promise<void> {
+  const stratum = catalog.strata.value.find((item) => item.id === artifact.stratumId)
+  if (stratum && catalog.isReadonly(stratum.trenchId)) {
+    ElMessage.error('封存探方只读，不能删除出土物；请先开启复勘草稿')
+    return
+  }
   await ElMessageBox.confirm(`确认删除出土物「${artifact.code}」？`, '删除确认', { type: 'warning' })
-  await artifactStore.getState().remove(artifact.id)
+  await catalog.removeArtifact(artifact.id)
   ElMessage.success('出土物已删除')
 }
 
@@ -203,7 +224,21 @@ function exportList(): void {
       { key: 'tempLocation', label: '临时存放' }
     ]
   )
-  ElMessage.success('出土物清单已导出')
+  ElMessage.success('出土物清单已导出（封存旧版请到探方清单的「封存版本」中导出）')
+}
+
+function openCommit(draft: SurveyDraft): void {
+  commitDraftRow.value = draft
+  commitVisible.value = true
+}
+
+async function abandonDraft(draft: SurveyDraft): Promise<void> {
+  await ElMessageBox.confirm('放弃该复勘草稿？草稿中的修改不会进入任何封存版本。', '放弃草稿', {
+    type: 'warning',
+    confirmButtonText: '放弃草稿'
+  })
+  await discardDraft(draft.id)
+  ElMessage.success('草稿已放弃')
 }
 </script>
 
@@ -213,93 +248,104 @@ function exportList(): void {
       <div>
         <h2 class="page-title">出土物登记与清单</h2>
         <p class="page-sub">
-          登记时先锁定所属地层单位（选择器按探方与类型级联），页面即时带出该单位的深度区间并校验出土深度是否落在区间内。
+          封存探方的出土物只读；复勘草稿中登记/修改的出土物只写入草稿工作区，提交后才进入新封存版本。
         </p>
       </div>
       <el-button @click="exportList">导出清单</el-button>
     </div>
+
+    <DraftBanner @submit="openCommit" @discard="abandonDraft" />
 
     <el-card shadow="never" class="form-card">
       <template #header>登记出土物（层位上下文锁定）</template>
       <UnitPicker
         v-model="pickStratumId"
         v-model:trench-id="pickTrenchId"
-        :trenches="trenchState.trenches"
-        :strata="stratumState.strata"
+        :trenches="catalog.trenches.value"
+        :strata="catalog.strata.value"
+        :disabled="formReadonly && !editingId"
       />
       <div v-if="lockedStratum" class="locked">
         <StratumDepthBar :stratum="lockedStratum" :length="240" />
         <span class="muted">
           该单位包含物：{{ lockedStratum.inclusions.join('、') || '无' }} · 堆积成因：{{ lockedStratum.formation || '—' }}
+          <el-tag v-if="formReadonly" type="info" size="small" effect="plain" style="margin-left: 6px">封存只读</el-tag>
+          <el-tag v-else-if="catalog.draftOf(lockedStratum.trenchId)" type="warning" size="small" effect="plain" style="margin-left: 6px">写入复勘草稿</el-tag>
         </span>
       </div>
       <el-form label-width="100px" class="form">
         <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="器物编号" required>
-              <el-input v-model="form.code" placeholder="如 T0501②:2" />
+              <el-input v-model="form.code" placeholder="如 T0501②:2" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="类别">
-              <el-select v-model="form.category" style="width: 100%">
+              <el-select v-model="form.category" style="width: 100%" :disabled="formReadonly">
                 <el-option v-for="item in ARTIFACT_CATEGORIES" :key="item" :label="item" :value="item" />
               </el-select>
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="件数">
-              <el-input-number v-model="form.count" :min="1" :controls="false" style="width: 100%" />
+              <el-input-number v-model="form.count" :min="1" :controls="false" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="残整程度">
-              <el-select v-model="form.completeness" style="width: 100%">
+              <el-select v-model="form.completeness" style="width: 100%" :disabled="formReadonly">
                 <el-option v-for="item in COMPLETENESS" :key="item" :label="item" :value="item" />
               </el-select>
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="出土 X(m)">
-              <el-input-number v-model="form.x" :min="0" :max="10" :step="0.1" :controls="false" style="width: 100%" />
+              <el-input-number v-model="form.x" :min="0" :max="10" :step="0.1" :controls="false" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="出土 Y(m)">
-              <el-input-number v-model="form.y" :min="0" :max="10" :step="0.1" :controls="false" style="width: 100%" />
+              <el-input-number v-model="form.y" :min="0" :max="10" :step="0.1" :controls="false" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="出土 Z 深度(m)">
-              <el-input-number v-model="form.z" :min="0" :max="10" :step="0.01" :precision="2" :controls="false" style="width: 100%" />
+              <el-input-number v-model="form.z" :min="0" :max="10" :step="0.01" :precision="2" :controls="false" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="出土日期">
-              <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+              <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="8">
             <el-form-item label="提取人">
-              <el-input v-model="form.collector" />
+              <el-input v-model="form.collector" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item label="临时存放">
-              <el-input v-model="form.tempLocation" placeholder="如 工地临时柜 A-2" />
+              <el-input v-model="form.tempLocation" placeholder="如 工地临时柜 A-2" :disabled="formReadonly" />
             </el-form-item>
           </el-col>
         </el-row>
       </el-form>
       <div class="actions">
-        <el-button type="primary" @click="submit">{{ editingId ? '保存修改' : '登记出土物' }}</el-button>
-        <el-button v-if="editingId" @click="resetForm">取消编辑</el-button>
+        <el-button v-if="!formReadonly" type="primary" @click="submit">{{ editingId ? '保存修改' : '登记出土物' }}</el-button>
+        <el-button v-if="editingId && !formReadonly" @click="resetForm">取消编辑</el-button>
+        <span v-if="formReadonly" class="muted">该探方已封存只读，请到探方清单「封存版本」开启复勘草稿后再改</span>
       </div>
     </el-card>
 
     <div class="toolbar">
       <el-select v-model="filterTrenchId" placeholder="全部探方" clearable style="width: 190px">
-        <el-option v-for="trench in trenchState.trenches" :key="trench.id" :label="`${trench.area} · ${trench.code}`" :value="trench.id" />
+        <el-option
+          v-for="trench in catalog.trenches.value"
+          :key="trench.id"
+          :label="`${trench.area} · ${trench.code}${catalog.isReadonly(trench.id) ? '（封存只读）' : catalog.draftOf(trench.id) ? '（复勘中）' : ''}`"
+          :value="trench.id"
+        />
       </el-select>
       <el-select v-model="filterCategory" placeholder="全部类别" clearable style="width: 130px">
         <el-option v-for="item in ARTIFACT_CATEGORIES" :key="item" :label="item" :value="item" />
@@ -309,7 +355,7 @@ function exportList(): void {
 
     <el-table :data="visible" border stripe row-key="id">
       <el-table-column prop="code" label="器物编号" width="140" />
-      <el-table-column label="探方" width="150">
+      <el-table-column label="探方" width="170">
         <template #default="{ row }: { row: Artifact }">
           <span class="mono">{{ trenchOf(row.stratumId) }}</span>
         </template>
@@ -322,8 +368,8 @@ function exportList(): void {
       <el-table-column label="深度区间" width="240">
         <template #default="{ row }: { row: Artifact }">
           <StratumDepthBar
-            v-if="stratumState.strata.find((item) => item.id === row.stratumId)"
-            :stratum="stratumState.strata.find((item) => item.id === row.stratumId)!"
+            v-if="catalog.strata.value.find((item) => item.id === row.stratumId)"
+            :stratum="catalog.strata.value.find((item) => item.id === row.stratumId)!"
             :length="170"
             :show-thickness="false"
           />
@@ -340,11 +386,15 @@ function exportList(): void {
       <el-table-column prop="tempLocation" label="临时存放" min-width="140" show-overflow-tooltip />
       <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }: { row: Artifact }">
-          <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+          <el-button link type="primary" size="small" @click="openEdit(row)">
+            {{ isRowReadonly(row) ? '查看' : '编辑' }}
+          </el-button>
+          <el-button v-if="!isRowReadonly(row)" link type="danger" size="small" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
+
+    <CommitDraftDialog v-model="commitVisible" :draft="commitDraftRow" @draft-rebased="() => (commitDraftRow = null)" />
   </div>
 </template>
 
