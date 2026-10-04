@@ -32,6 +32,18 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/pages/SectionsPage.vue'),
     meta: { title: '四壁剖面示意' }
   },
+  {
+    path: '/archive',
+    name: 'archive',
+    component: () => import('@/pages/ArchivePage.vue'),
+    meta: { title: '封存版本' }
+  },
+  {
+    path: '/rework',
+    name: 'rework',
+    component: () => import('@/pages/ReworkPage.vue'),
+    meta: { title: '复勘工作台' }
+  },
   { path: '/:pathMatch(.*)*', redirect: '/trenches' }
 ]
 

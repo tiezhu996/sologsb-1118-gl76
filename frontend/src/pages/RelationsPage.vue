@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Relation, RelationBasis, RelationType } from '@/types'
 import { RELATION_BASES, RELATION_TYPES } from '@/types'
@@ -10,13 +11,17 @@ import { checkRelationCycle, useRelationGraph } from '@/hooks/useRelationGraph'
 import { relationStore } from '@/stores/relationStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { trenchStore } from '@/stores/trenchStore'
+import { sealStore } from '@/stores/sealStore'
+import { isTrenchFrozenError } from '@/utils/errors'
 import { uid } from '@/utils/id'
 
+const route = useRoute()
 const relationState = useStore(relationStore)
 const stratumState = useStore(stratumStore)
 const trenchState = useStore(trenchStore)
+const sealState = useStore(sealStore)
 
-const filterTrenchId = ref('')
+const filterTrenchId = ref(typeof route.query.trench === 'string' ? route.query.trench : '')
 const activeId = ref<string | null>(null)
 const editingId = ref<string | null>(null)
 
@@ -34,6 +39,26 @@ const graphStrata = computed(() =>
     ? stratumState.strata.filter((item) => item.trenchId === filterTrenchId.value)
     : stratumState.strata
 )
+
+/** 当前筛选探方是否已封存只读 */
+const filterTrenchSealed = computed(() => Boolean(filterTrenchId.value && sealState.isSealed(filterTrenchId.value)))
+
+function trenchIdOfUnit(unitId: string): string | null {
+  return stratumState.strata.find((item) => item.id === unitId)?.trenchId ?? null
+}
+
+function isFrozenRelation(relation: Relation): boolean {
+  const a = trenchIdOfUnit(relation.unitAId)
+  const b = trenchIdOfUnit(relation.unitBId)
+  return Boolean((a && sealState.isSealed(a)) || (b && sealState.isSealed(b)))
+}
+
+/** 表单当前选中的单位是否命中封存探方 */
+const formSealed = computed(() => {
+  const a = trenchIdOfUnit(form.unitAId)
+  const b = trenchIdOfUnit(form.unitBId)
+  return Boolean((a && sealState.isSealed(a)) || (b && sealState.isSealed(b)))
+})
 
 const { graph, highlighted, degreeOf } = useRelationGraph(
   graphStrata,
@@ -80,6 +105,10 @@ async function submit(): Promise<void> {
     ElMessage.error('单位 A 与单位 B 不能相同')
     return
   }
+  if (formSealed.value) {
+    ElMessage.error('涉及的探方已封存只读，层位关系改动请走复勘草稿')
+    return
+  }
   const others = relationState.relations.filter((item) => item.id !== editingId.value)
   if (checkRelationCycle(others, { unitAId: form.unitAId, unitBId: form.unitBId, type: form.type })) {
     ElMessage.error(
@@ -96,12 +125,24 @@ async function submit(): Promise<void> {
     recorder: form.recorder.trim(),
     note: form.note.trim()
   }
-  await relationStore.getState().save(row)
+  try {
+    await relationStore.getState().save(row)
+  } catch (error) {
+    if (isTrenchFrozenError(error)) {
+      ElMessage.error('该探方已封存只读，层位关系改动请走复勘草稿')
+      return
+    }
+    throw error
+  }
   ElMessage.success(`已记录：${unitLabel(row.unitAId)} ${row.type} ${unitLabel(row.unitBId)}`)
   resetForm()
 }
 
 function edit(relation: Relation): void {
+  if (isFrozenRelation(relation)) {
+    ElMessage.info('该关系涉及的探方已封存只读，请先开启复勘草稿')
+    return
+  }
   editingId.value = relation.id
   Object.assign(form, {
     unitAId: relation.unitAId,
@@ -119,8 +160,16 @@ async function remove(relation: Relation): Promise<void> {
     '删除确认',
     { type: 'warning' }
   )
-  await relationStore.getState().remove(relation.id)
-  ElMessage.success('关系已删除')
+  try {
+    await relationStore.getState().remove(relation.id)
+    ElMessage.success('关系已删除')
+  } catch (error) {
+    if (isTrenchFrozenError(error)) {
+      ElMessage.error('该探方已封存只读，删除关系请走复勘草稿')
+    } else {
+      throw error
+    }
+  }
 }
 
 function selectNode(nodeId: string): void {
@@ -141,6 +190,16 @@ function selectNode(nodeId: string): void {
         <el-option v-for="trench in trenchState.trenches" :key="trench.id" :label="`${trench.area} · ${trench.code}`" :value="trench.id" />
       </el-select>
     </div>
+
+    <el-alert
+      v-if="filterTrenchSealed"
+      class="alert"
+      type="info"
+      :closable="false"
+      show-icon
+      title="当前探方已封存，层位关系为只读"
+      description="改正叠压、打破、共存关系，请从封存版开启复勘草稿；提交复勘后生成新版本。"
+    />
 
     <el-alert
       v-if="graph.hasCycle"
@@ -192,10 +251,11 @@ function selectNode(nodeId: string): void {
             :strata="stratumState.strata"
             :trench-id="filterTrenchId"
             :model-value="form.unitAId"
+            :disabled="formSealed || filterTrenchSealed"
             :show-depth-range="false"
             @update:model-value="(value: string) => (form.unitAId = value)"
           />
-          <el-form label-width="76px" size="small" class="rel-form">
+          <el-form label-width="76px" size="small" class="rel-form" :disabled="formSealed || filterTrenchSealed">
             <el-form-item label="关系类型">
               <el-select v-model="form.type" style="width: 100%">
                 <el-option v-for="item in RELATION_TYPES" :key="item" :label="item" :value="item" />
@@ -223,7 +283,7 @@ function selectNode(nodeId: string): void {
               <el-input v-model="form.note" type="textarea" :rows="2" placeholder="如 H12 开口于第②层下，打破 L02" />
             </el-form-item>
             <div class="actions">
-              <el-button type="primary" size="small" @click="submit">保存关系</el-button>
+              <el-button type="primary" size="small" :disabled="formSealed || filterTrenchSealed" @click="submit">保存关系</el-button>
               <el-button v-if="editingId" size="small" @click="resetForm">取消</el-button>
             </div>
           </el-form>
@@ -238,8 +298,8 @@ function selectNode(nodeId: string): void {
               <span class="mono">{{ unitLabel(relation.unitBId) }}</span>
               <span class="muted">（{{ relation.basis }} · {{ relation.recorder || '未填记录人' }}）</span>
               <span class="ops">
-                <el-button link type="primary" size="small" @click="edit(relation)">编辑</el-button>
-                <el-button link type="danger" size="small" @click="remove(relation)">删除</el-button>
+                <el-button link type="primary" size="small" :disabled="isFrozenRelation(relation)" @click="edit(relation)">编辑</el-button>
+                <el-button link type="danger" size="small" :disabled="isFrozenRelation(relation)" @click="remove(relation)">删除</el-button>
               </span>
             </li>
             <li v-if="relationState.relations.length === 0" class="muted">暂无层位关系</li>

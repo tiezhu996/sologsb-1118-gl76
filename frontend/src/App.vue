@@ -1,24 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { useStore } from '@/hooks/usePersistentStore'
+import { onDataChange, useStore } from '@/hooks/usePersistentStore'
 import { trenchStore } from '@/stores/trenchStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
+import { sealStore } from '@/stores/sealStore'
 
 const route = useRoute()
 const trenchState = useStore(trenchStore)
 const stratumState = useStore(stratumStore)
 const artifactState = useStore(artifactStore)
 const relationState = useStore(relationStore)
+const sealState = useStore(sealStore)
 
 const menus = [
   { path: '/trenches', label: '探方清单', icon: 'Grid' },
   { path: '/strata', label: '地层单位编目', icon: 'Files' },
   { path: '/artifacts', label: '出土物登记', icon: 'Box' },
   { path: '/relations', label: '层位关系', icon: 'Share' },
-  { path: '/sections', label: '四壁剖面示意', icon: 'DataLine' }
+  { path: '/sections', label: '四壁剖面示意', icon: 'DataLine' },
+  { path: '/archive', label: '封存版本', icon: 'FolderOpened' }
 ]
 
 const activeMenu = computed(() => menus.find((item) => route.path.startsWith(item.path))?.path ?? '/trenches')
@@ -27,14 +30,24 @@ const stats = computed(() => [
   { label: '探方', value: trenchState.trenches.length },
   { label: '地层单位', value: stratumState.strata.length },
   { label: '出土物', value: artifactState.artifacts.length },
-  { label: '层位关系', value: relationState.relations.length }
+  { label: '层位关系', value: relationState.relations.length },
+  { label: '封存版本', value: sealState.versions.length },
+  { label: '复勘草稿', value: sealState.drafts.length }
 ])
 
 onMounted(async () => {
-  await trenchStore.getState().hydrate()
-  await stratumStore.getState().hydrate()
-  await artifactStore.getState().hydrate()
-  await relationStore.getState().hydrate()
+  // 其他标签页（或本页封存/复勘提交）写入后，自动刷新各实时表，避免双标签页互相覆盖
+  let pending: ReturnType<typeof setTimeout> | null = null
+  onDataChange(() => {
+    if (pending) clearTimeout(pending)
+    pending = setTimeout(() => {
+      void sealStore.getState().hydrate()
+      void trenchStore.getState().hydrate()
+      void stratumStore.getState().hydrate()
+      void artifactStore.getState().hydrate()
+      void relationStore.getState().hydrate()
+    }, 60)
+  })
 })
 </script>
 
@@ -60,6 +73,9 @@ onMounted(async () => {
           <b>{{ item.value }}</b>
         </div>
         <p class="stat-tip">数据保存在浏览器 IndexedDB，无需后端服务</p>
+        <p v-if="sealState.drafts.length > 0" class="stat-tip draft-tip">
+          <router-link to="/rework">有 {{ sealState.drafts.length }} 份复勘草稿进行中，前往复勘工作台 →</router-link>
+        </p>
       </div>
     </el-aside>
     <el-container>
@@ -144,6 +160,13 @@ onMounted(async () => {
   margin: 8px 0 0;
   color: #bfae95;
   line-height: 1.6;
+}
+.draft-tip {
+  color: #e0c168;
+}
+.draft-tip a {
+  color: #e0c168;
+  text-decoration: none;
 }
 .header {
   display: flex;

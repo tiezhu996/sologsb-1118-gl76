@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Inclusion, Stratum, UnitType } from '@/types'
 import { INCLUSIONS, UNIT_TYPES, isCodeDuplicated, isDepthInverted, stratumThickness } from '@/types'
@@ -11,19 +12,23 @@ import { stratumStore } from '@/stores/stratumStore'
 import { trenchStore } from '@/stores/trenchStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
+import { sealStore } from '@/stores/sealStore'
+import { isTrenchFrozenError } from '@/utils/errors'
 import { uid } from '@/utils/id'
 
+const route = useRoute()
 const trenchState = useStore(trenchStore)
 const stratumState = useStore(stratumStore)
 const artifactState = useStore(artifactStore)
 const relationState = useStore(relationStore)
+const sealState = useStore(sealStore)
 
 const { result: order } = useStratumOrder(
   computed(() => stratumState.strata),
   computed(() => relationState.relations)
 )
 
-const filterTrenchId = ref('')
+const filterTrenchId = ref(typeof route.query.trench === 'string' ? route.query.trench : '')
 const filterType = ref<UnitType | ''>('')
 const depthFrom = ref<number | undefined>(undefined)
 const depthTo = ref<number | undefined>(undefined)
@@ -57,9 +62,21 @@ const visible = computed(() =>
   })
 )
 
+/** 当前筛选探方是否已封存只读 */
+const filterTrenchSealed = computed(() => Boolean(filterTrenchId.value && sealState.isSealed(filterTrenchId.value)))
+
+/** 命中行中包含的封存探方数（用于提示只读范围） */
+const sealedTrenchCount = computed(
+  () => new Set(visible.value.map((item) => item.trenchId).filter((id) => sealState.isSealed(id))).size
+)
+
 function trenchLabel(trenchId: string): string {
   const trench = trenchState.trenches.find((item) => item.id === trenchId)
   return trench ? `${trench.area} · ${trench.code}` : '未知探方'
+}
+
+function isFrozenStratum(stratum: Stratum): boolean {
+  return sealState.isSealed(stratum.trenchId)
 }
 
 function artifactsOf(stratumId: string): number {
@@ -75,6 +92,7 @@ function duplicatedOf(stratum: Stratum): boolean {
 }
 
 function rowClass(param: { row: Stratum }): string {
+  if (isFrozenStratum(param.row)) return 'frozen-row'
   if (invertedOf(param.row)) return 'inverted-row'
   if (duplicatedOf(param.row)) return 'duplicate-row'
   return ''
@@ -108,11 +126,20 @@ function resetForm(): void {
 }
 
 function openCreate(): void {
+  if (filterTrenchSealed.value) {
+    ElMessage.info('该探方已封存只读，请从封存版开启复勘草稿')
+    return
+  }
   resetForm()
+  if (filterTrenchId.value) form.trenchId = filterTrenchId.value
   dialogVisible.value = true
 }
 
 function openEdit(stratum: Stratum): void {
+  if (isFrozenStratum(stratum)) {
+    ElMessage.info(`单位「${stratum.code}」所属探方已封存只读，请先开启复勘草稿`)
+    return
+  }
   editingId.value = stratum.id
   Object.assign(form, {
     trenchId: stratum.trenchId,
@@ -162,13 +189,21 @@ async function submit(): Promise<void> {
     date: form.date,
     drawingNo: form.drawingNo.trim()
   }
-  await stratumStore.getState().save(row)
-  if (isDepthInverted(row)) {
-    ElMessage.warning(`已保存，但「${row.code}」上界深度大于下界，层序倒置需复核`)
-  } else {
-    ElMessage.success(`地层单位 ${row.code} 已保存（厚 ${stratumThickness(row)} m）`)
+  try {
+    await stratumStore.getState().save(row)
+    if (isDepthInverted(row)) {
+      ElMessage.warning(`已保存，但「${row.code}」上界深度大于下界，层序倒置需复核`)
+    } else {
+      ElMessage.success(`地层单位 ${row.code} 已保存（厚 ${stratumThickness(row)} m）`)
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    if (isTrenchFrozenError(error)) {
+      ElMessage.error(`探方已封存只读：${trenchLabel(error.trenchId)}，请开启复勘草稿后再修改`)
+    } else {
+      throw error
+    }
   }
-  dialogVisible.value = false
 }
 
 async function remove(stratum: Stratum): Promise<void> {
@@ -181,8 +216,16 @@ async function remove(stratum: Stratum): Promise<void> {
     return
   }
   await ElMessageBox.confirm(`确认删除地层单位「${stratum.code}」？`, '删除确认', { type: 'warning' })
-  await stratumStore.getState().remove(stratum.id)
-  ElMessage.success('地层单位已删除')
+  try {
+    await stratumStore.getState().remove(stratum.id)
+    ElMessage.success('地层单位已删除')
+  } catch (error) {
+    if (isTrenchFrozenError(error)) {
+      ElMessage.error('该探方已封存只读，删除请走复勘草稿')
+    } else {
+      throw error
+    }
+  }
 }
 
 async function applyBatchType(): Promise<void> {
@@ -190,8 +233,16 @@ async function applyBatchType(): Promise<void> {
     ElMessage.warning('请先勾选要调整的单位')
     return
   }
-  await stratumStore.getState().bulkSetType(selectedIds.value, batchType.value)
-  ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
+  try {
+    await stratumStore.getState().bulkSetType(selectedIds.value, batchType.value)
+    ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
+  } catch (error) {
+    if (isTrenchFrozenError(error)) {
+      ElMessage.error('勾选记录中包含已封存探方（只读），批量调整已整体取消')
+    } else {
+      throw error
+    }
+  }
 }
 </script>
 
@@ -201,13 +252,23 @@ async function applyBatchType(): Promise<void> {
       <div>
         <h2 class="page-title">地层单位编目表</h2>
         <p class="page-sub">
-          按类型与深度区间筛选；层序倒置（上界大于下界）与同一探方内单位号重复即时高亮提示，深度刻度条展示厚度。
+          按类型与深度区间筛选；层序倒置（上界大于下界）与同一探方内单位号重复即时高亮提示，深度刻度条展示厚度。已封存探方的记录默认只读。
         </p>
       </div>
-      <el-button type="primary" @click="openCreate">
+      <el-button type="primary" :disabled="filterTrenchSealed" @click="openCreate">
         <el-icon><Plus /></el-icon>新建地层单位
       </el-button>
     </div>
+
+    <el-alert
+      v-if="filterTrenchSealed"
+      class="alert"
+      type="info"
+      :closable="false"
+      show-icon
+      title="当前探方已封存，地层单位为只读"
+      description="改正地层、层位关系或出土物，请从封存版开启复勘草稿；提交后生成新版本，本封存版保持不变。"
+    />
 
     <el-alert
       v-if="order.inverted.length > 0 || order.duplicateCodes.length > 0"
@@ -254,6 +315,7 @@ async function applyBatchType(): Promise<void> {
       </el-select>
       <el-button type="primary" plain @click="applyBatchType">批量调整类型</el-button>
       <el-tag type="info" effect="plain">命中 {{ visible.length }} / {{ stratumState.strata.length }} 个单位</el-tag>
+      <el-tag v-if="sealedTrenchCount > 0" type="info" effect="dark"><el-icon><Lock /></el-icon>&nbsp;含 {{ sealedTrenchCount }} 个封存探方（只读）</el-tag>
     </div>
 
     <el-table
@@ -264,7 +326,7 @@ async function applyBatchType(): Promise<void> {
       :row-class-name="rowClass"
       @selection-change="(rows: Stratum[]) => (selectedIds = rows.map((row) => row.id))"
     >
-      <el-table-column type="selection" width="46" />
+      <el-table-column type="selection" width="46" :selectable="(row: Stratum) => !isFrozenStratum(row)" />
       <el-table-column label="序号" width="70">
         <template #default="{ row }: { row: Stratum }">{{ order.indexOf.get(row.id) ?? '—' }}</template>
       </el-table-column>
@@ -277,6 +339,7 @@ async function applyBatchType(): Promise<void> {
         <template #default="{ row }: { row: Stratum }">
           <span class="mono">{{ row.code }}</span>
           <el-tag v-if="duplicatedOf(row)" type="warning" size="small" effect="dark" class="mini">重复</el-tag>
+          <el-tag v-if="isFrozenStratum(row)" type="info" size="small" effect="plain" class="mini"><el-icon><Lock /></el-icon>&nbsp;封存</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="类型" width="120">
@@ -309,8 +372,8 @@ async function applyBatchType(): Promise<void> {
       </el-table-column>
       <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }: { row: Stratum }">
-          <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+          <el-button link type="primary" size="small" :disabled="isFrozenStratum(row)" @click="openEdit(row)">编辑</el-button>
+          <el-button link type="danger" size="small" :disabled="isFrozenStratum(row)" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -411,5 +474,9 @@ async function applyBatchType(): Promise<void> {
   margin: 0;
   color: #c0392b;
   font-size: 12px;
+}
+:deep(.frozen-row) {
+  background: #f4f6f9 !important;
+  color: #8a93a0;
 }
 </style>

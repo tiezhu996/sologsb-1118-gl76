@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Artifact, ArtifactCategory, Completeness } from '@/types'
 import { ARTIFACT_CATEGORIES, COMPLETENESS } from '@/types'
@@ -9,17 +10,21 @@ import { useStore } from '@/hooks/usePersistentStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { trenchStore } from '@/stores/trenchStore'
+import { sealStore } from '@/stores/sealStore'
+import { isTrenchFrozenError } from '@/utils/errors'
 import { downloadCsv } from '@/utils/export'
 import { uid } from '@/utils/id'
 
+const route = useRoute()
 const artifactState = useStore(artifactStore)
 const stratumState = useStore(stratumStore)
 const trenchState = useStore(trenchStore)
+const sealState = useStore(sealStore)
 
-const pickTrenchId = ref('')
+const pickTrenchId = ref(typeof route.query.trench === 'string' ? route.query.trench : '')
 const pickStratumId = ref('')
 const filterCategory = ref<ArtifactCategory | ''>('')
-const filterTrenchId = ref('')
+const filterTrenchId = ref(typeof route.query.trench === 'string' ? route.query.trench : '')
 const editingId = ref<string | null>(null)
 
 const form = reactive({
@@ -36,6 +41,17 @@ const form = reactive({
 })
 
 const lockedStratum = computed(() => stratumState.strata.find((item) => item.id === pickStratumId.value) ?? null)
+/** 登记面板当前锁定探方是否已封存只读 */
+const lockedSealed = computed(() => Boolean(lockedStratum.value && sealState.isSealed(lockedStratum.value.trenchId)))
+
+function trenchIdOfArtifact(artifact: Artifact): string | null {
+  return stratumState.strata.find((item) => item.id === artifact.stratumId)?.trenchId ?? null
+}
+
+function isFrozenArtifact(artifact: Artifact): boolean {
+  const trenchId = trenchIdOfArtifact(artifact)
+  return Boolean(trenchId && sealState.isSealed(trenchId))
+}
 
 watch(
   () => [trenchState.trenches.length, pickTrenchId.value] as const,
@@ -104,6 +120,10 @@ function resetForm(): void {
 }
 
 function openEdit(artifact: Artifact): void {
+  if (isFrozenArtifact(artifact)) {
+    ElMessage.info('该出土物所属探方已封存只读，请先开启复勘草稿')
+    return
+  }
   editingId.value = artifact.id
   const stratum = stratumState.strata.find((item) => item.id === artifact.stratumId)
   if (stratum) {
@@ -127,6 +147,10 @@ function openEdit(artifact: Artifact): void {
 async function submit(): Promise<void> {
   if (!lockedStratum.value) {
     ElMessage.warning('请先选择所属地层单位')
+    return
+  }
+  if (lockedSealed.value) {
+    ElMessage.error('该探方已封存只读，出土物改动请走复勘草稿')
     return
   }
   if (!form.code.trim()) {
@@ -167,8 +191,16 @@ async function submit(): Promise<void> {
 
 async function remove(artifact: Artifact): Promise<void> {
   await ElMessageBox.confirm(`确认删除出土物「${artifact.code}」？`, '删除确认', { type: 'warning' })
-  await artifactStore.getState().remove(artifact.id)
-  ElMessage.success('出土物已删除')
+  try {
+    await artifactStore.getState().remove(artifact.id)
+    ElMessage.success('出土物已删除')
+  } catch (error) {
+    if (isTrenchFrozenError(error)) {
+      ElMessage.error('该探方已封存只读，删除请走复勘草稿')
+    } else {
+      throw error
+    }
+  }
 }
 
 function exportList(): void {
@@ -219,6 +251,16 @@ function exportList(): void {
       <el-button @click="exportList">导出清单</el-button>
     </div>
 
+    <el-alert
+      v-if="lockedSealed"
+      class="alert"
+      type="info"
+      :closable="false"
+      show-icon
+      title="锁定单位所属探方已封存，出土物为只读"
+      description="改正出土物记录，请从封存版开启复勘草稿，提交复勘后生成新版本，封存版与历史导出不变。"
+    />
+
     <el-card shadow="never" class="form-card">
       <template #header>登记出土物（层位上下文锁定）</template>
       <UnitPicker
@@ -233,7 +275,7 @@ function exportList(): void {
           该单位包含物：{{ lockedStratum.inclusions.join('、') || '无' }} · 堆积成因：{{ lockedStratum.formation || '—' }}
         </span>
       </div>
-      <el-form label-width="100px" class="form">
+      <el-form label-width="100px" class="form" :disabled="lockedSealed">
         <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="器物编号" required>
@@ -292,7 +334,7 @@ function exportList(): void {
         </el-row>
       </el-form>
       <div class="actions">
-        <el-button type="primary" @click="submit">{{ editingId ? '保存修改' : '登记出土物' }}</el-button>
+        <el-button type="primary" :disabled="lockedSealed" @click="submit">{{ editingId ? '保存修改' : '登记出土物' }}</el-button>
         <el-button v-if="editingId" @click="resetForm">取消编辑</el-button>
       </div>
     </el-card>
@@ -340,8 +382,8 @@ function exportList(): void {
       <el-table-column prop="tempLocation" label="临时存放" min-width="140" show-overflow-tooltip />
       <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }: { row: Artifact }">
-          <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-          <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+          <el-button link type="primary" size="small" :disabled="isFrozenArtifact(row)" @click="openEdit(row)">编辑</el-button>
+          <el-button link type="danger" size="small" :disabled="isFrozenArtifact(row)" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -349,6 +391,9 @@ function exportList(): void {
 </template>
 
 <style scoped>
+.alert {
+  margin-bottom: 14px;
+}
 .form-card {
   border-radius: 12px;
   margin-bottom: 16px;
